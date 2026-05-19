@@ -79,6 +79,53 @@ def _remap_xcd_tile_grid(
 
 
 @triton.jit
+def _resolve_gmm_tile(
+    tile,  # global tile to be resolved into (g, m, num_m_tiles, last_m, tile_in_mm)
+    group_sizes_ptr,  # group sizes tensor
+    G: int,  # number of groups
+    num_n_tiles: int,  # number of tiles in column dimension
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    int_type = group_sizes_ptr.type.element_ty
+    zero = tl.cast(0, int_type)
+
+    g = zero  # group index to be resolved
+    last_m = zero  # last row of lhs / out to be resolved
+    last_mm_tile = zero
+    cumsum_m = zero
+    cumsum_tile = zero
+
+    # Linear scan through all G group sizes:
+    for g_ in range(G):
+        # Group size, i.e. number of lhs / out rows for the group MM.
+        m_g = tl.load(group_sizes_ptr + g_)
+        # Number of tiles.
+        num_tiles_g = tl.cdiv(m_g, BLOCK_SIZE_M) * num_n_tiles
+
+        # Accumulate rows of lhs / our and number of tiles.
+        new_cumsum_m = cumsum_m + m_g
+        new_cumsum_tile = cumsum_tile + num_tiles_g
+
+        # If the tile to be resolved is greater than or equal to accumulated
+        # number of tiles, then we should advance to the next group.
+        if tile >= new_cumsum_tile:
+            g = g_ + 1
+            last_m = new_cumsum_m
+            last_mm_tile = new_cumsum_tile
+
+        cumsum_m = new_cumsum_m
+        cumsum_tile = new_cumsum_tile
+
+    # Resolve the remaining tile properties: group size, number of tiles in row
+    # dimension and local tile coordinate.
+    m = tl.load(group_sizes_ptr + g)
+    num_m_tiles = tl.cdiv(m, BLOCK_SIZE_M)
+    tile_in_mm = tile - last_mm_tile
+
+    return g, m, num_m_tiles, last_m, tile_in_mm
+
+
+@triton.jit
 def _process_gmm_tile(
     # Tensor pointers:
     lhs_ptr,
