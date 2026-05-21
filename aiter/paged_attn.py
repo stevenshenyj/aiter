@@ -22,6 +22,7 @@ import torch
 
 import aiter as ops
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 
 
 # from vllm.utils import is_hip
@@ -250,6 +251,49 @@ class PagedAttention:
         block_size = key_cache.size(3)
         output = torch.empty_like(query, dtype=output_dtype)
 
+        cpa_fp8_out = False
+        if fp8_out_scale is not None:
+            output = torch.empty_like(output, dtype=dtypes.fp8)
+            cpa_fp8_out = True
+        if scale is None:
+            scale = float(1.0 / (head_size**0.5))
+
+        batch = seq_lens.numel()
+        gqa_ratio = num_heads // num_kv_heads
+        # For uniform MTP decode with shuffled FP8 KV, route to the existing
+        # QTP-driven ASM kernels. These CSV Mtp=1 kernels use qo_indptr to
+        # select qlen 2/3/4 internally and avoid the generated HIP shuffled-MTP
+        # path, which is less accurate for this shape.
+        use_mtp_asm = (
+            mtp in (2, 3, 4)
+            and gqa_ratio in (8, 16)
+            and get_gfx() in ("gfx942", "gfx950")
+            and block_size == 16
+            and head_size == 128
+            and value_cache.dim() == 5
+            and q_scale is None
+            and fp8_out_scale is None
+            and num_seqs == batch * mtp
+            and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        )
+        if use_mtp_asm:
+            qo_indptr = torch.arange(
+                0, num_seqs + 1, mtp, device=query.device, dtype=torch.int32
+            )
+            return ops.pa_fwd_asm(
+                query,
+                key_cache,
+                value_cache,
+                block_tables,
+                seq_lens,
+                block_tables.stride(0),
+                mtp,
+                k_scale,
+                v_scale,
+                output,
+                qo_indptr,
+            )
+
         max_num_partitions = (
             max_seq_len + _PARTITION_SIZE_ROCM - 1
         ) // _PARTITION_SIZE_ROCM
@@ -264,12 +308,7 @@ class PagedAttention:
             device=output.device,
         )
         max_logits = torch.empty_like(exp_sums)
-        cpa_fp8_out = False
-        if fp8_out_scale is not None:
-            output = torch.empty_like(output, dtype=dtypes.fp8)
-            cpa_fp8_out = True
-        if scale is None:
-            scale = float(1.0 / (head_size**0.5))
+
         torch.ops.aiter.paged_attention_rocm(
             output,
             exp_sums,
