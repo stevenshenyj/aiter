@@ -129,6 +129,7 @@ def benchmark_gmm(
     use_bias: bool = False,
     accumulate: bool = False,
     grid_dim: int | None = None,
+    work_stealing: bool = False,
     output: bool = False,
 ) -> None:
     assert gmm_type in GMM_TYPES, "Invalid GMM type."
@@ -141,6 +142,7 @@ def benchmark_gmm(
     group_sizes_dtype_str: str = str_from_group_sizes_dtype(group_sizes_dtype)
     unit: str = METRIC_UNITS[metric]
     has_grid_dim: bool = gmm_type != "nptgmm" and grid_dim is not None
+    has_work_stealing: bool = gmm_type == "gmm" and work_stealing
     triton_provider_desc: list[str] = [
         "triton",
         gmm_type,
@@ -154,6 +156,9 @@ def benchmark_gmm(
     # grid dim
     if has_grid_dim:
         triton_provider_desc.append(f"gd{grid_dim}")
+    # work stealing
+    if has_work_stealing:
+        triton_provider_desc.append("ws")
     # unit of benchmark metric
     triton_provider_desc.append(unit)
     triton_provider: str = "_".join(triton_provider_desc)
@@ -211,6 +216,7 @@ def benchmark_gmm(
 
             if gmm_type == "gmm":
                 kwargs["bias"] = bias
+                kwargs["work_stealing"] = work_stealing
             elif gmm_type == "ptgmm" or gmm_type == "nptgmm":
                 kwargs["bias_grad"] = bias
                 kwargs["accumulate"] = accumulate
@@ -309,6 +315,8 @@ def benchmark_gmm(
     )
     if has_grid_dim:
         logging.info("  overridden persistent grid_dim = %d", grid_dim)
+    if has_work_stealing:
+        logging.info("  work stealing enabled")
     logging.info(
         "  metric = %s (in %s)",
         metric,
@@ -467,6 +475,11 @@ def parse_args() -> argparse.Namespace:
         help="override grid dimension config of persistent kernels",
     )
     parser.add_argument(
+        "--work-stealing",
+        action="store_true",
+        help="enable work stealing dynamic load-balancing of persistent kernels",
+    )
+    parser.add_argument(
         "-o",
         action="store_true",
         help="write performance results to CSV file in the current directory",
@@ -516,6 +529,7 @@ def main() -> None:
         use_bias=args.use_bias,
         accumulate=args.accumulate,
         grid_dim=args.grid_dim,
+        work_stealing=args.work_stealing,
         output=args.o,
     )
 

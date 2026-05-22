@@ -220,6 +220,7 @@ def _process_gmm_tile(
 
 @triton.heuristics(
     {
+        "BLOCK_SIZE_G": lambda META: triton.next_power_of_2(META["G"]),
         "K_DIVISIBLE_BY_BLOCK_SIZE_K": lambda META: META["K"] % META["BLOCK_SIZE_K"]
         == 0,
     }
@@ -239,6 +240,7 @@ def gmm_kernel(
     G: int,
     # Meta-parameters:
     TRANS_RHS: tl.constexpr,
+    BLOCK_SIZE_G: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -246,6 +248,7 @@ def gmm_kernel(
     GROUP_SIZE: tl.constexpr,
     GRID_DIM: tl.constexpr,
     USE_BIAS: tl.constexpr,
+    WORK_STEALING: tl.constexpr,
 ):
     tl.assume(M > 0)
     tl.assume(K > 0)
