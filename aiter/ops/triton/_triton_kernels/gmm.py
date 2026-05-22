@@ -79,50 +79,72 @@ def _remap_xcd_tile_grid(
 
 
 @triton.jit
-def _resolve_gmm_tile(
-    tile,  # global tile to be resolved into (g, m, num_m_tiles, last_m, tile_in_mm)
-    group_sizes_ptr,  # group sizes tensor
-    G: int,  # number of groups
-    num_n_tiles: int,  # number of tiles in column dimension
+def _total_gmm_tiles(
+    group_sizes_ptr,
+    G: int,
+    N: int,
+    BLOCK_SIZE_G: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
 ):
+    tl.assume(G > 0)
+    tl.assume(N > 0)
     int_type = group_sizes_ptr.type.element_ty
-    zero = tl.cast(0, int_type)
+    g_range = tl.arange(0, BLOCK_SIZE_G)
+    g_mask = g_range < G
+    zeros = tl.zeros((BLOCK_SIZE_G,), int_type)
+    group_sizes = tl.load(group_sizes_ptr + g_range, mask=g_mask, other=0)
+    num_m_tiles = tl.cdiv(group_sizes, BLOCK_SIZE_M)
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(int_type)
+    num_tiles = num_m_tiles * num_n_tiles
+    cumsum_tile = tl.where(g_mask, tl.cumsum(num_tiles, dtype=int_type), zeros)
+    total_tiles = tl.max(cumsum_tile)
+    tl.device_assert(total_tiles > 0, "total_tiles <= 0")
+    return total_tiles
 
-    g = zero  # group index to be resolved
-    last_m = zero  # last row of lhs / out to be resolved
-    last_mm_tile = zero
-    cumsum_m = zero
-    cumsum_tile = zero
 
-    # Linear scan through all G group sizes:
-    for g_ in range(G):
-        # Group size, i.e. number of lhs / out rows for the group MM.
-        m_g = tl.load(group_sizes_ptr + g_)
-        # Number of tiles.
-        num_tiles_g = tl.cdiv(m_g, BLOCK_SIZE_M) * num_n_tiles
-
-        # Accumulate rows of lhs / our and number of tiles.
-        new_cumsum_m = cumsum_m + m_g
-        new_cumsum_tile = cumsum_tile + num_tiles_g
-
-        # If the tile to be resolved is greater than or equal to accumulated
-        # number of tiles, then we should advance to the next group.
-        if tile >= new_cumsum_tile:
-            g = g_ + 1
-            last_m = new_cumsum_m
-            last_mm_tile = new_cumsum_tile
-
-        cumsum_m = new_cumsum_m
-        cumsum_tile = new_cumsum_tile
-
-    # Resolve the remaining tile properties: group size, number of tiles in row
-    # dimension and local tile coordinate.
-    m = tl.load(group_sizes_ptr + g)
-    num_m_tiles = tl.cdiv(m, BLOCK_SIZE_M)
-    tile_in_mm = tile - last_mm_tile
-
-    return g, m, num_m_tiles, last_m, tile_in_mm
+@triton.jit
+def _resolve_gmm_tile(
+    group_sizes_ptr,
+    tile,
+    G: int,
+    N: int,
+    BLOCK_SIZE_G: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    tl.assume(G > 0)
+    tl.assume(N > 0)
+    tl.device_assert(tile >= 0, "tile < 0")
+    int_type = group_sizes_ptr.type.element_ty
+    g_range = tl.arange(0, BLOCK_SIZE_G)
+    g_mask = g_range < G
+    zeros = tl.zeros((BLOCK_SIZE_G,), int_type)
+    group_sizes = tl.load(group_sizes_ptr + g_range, mask=g_mask, other=0)
+    num_m_tiles = tl.cdiv(group_sizes, BLOCK_SIZE_M)
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N).to(int_type)
+    num_tiles = num_m_tiles * num_n_tiles
+    cumsum_tile = tl.where(g_mask, tl.cumsum(num_tiles, dtype=int_type), zeros)
+    total_tiles = tl.max(cumsum_tile)
+    tl.device_assert(total_tiles > 0, "total_tiles <= 0")
+    tl.device_assert(tile < total_tiles, "tile >= total_tiles")
+    cumsum_m = tl.where(g_mask, tl.cumsum(group_sizes, dtype=int_type), zeros)
+    g = tl.sum((cumsum_tile <= tile) & g_mask, dtype=int_type)
+    tl.device_assert(g >= 0, "g < 0")
+    tl.device_assert(g < G, "g >= G")
+    prev_mask = g_range < g
+    prev_cumsum_m = tl.max(tl.where(prev_mask, cumsum_m, zeros))
+    tl.device_assert(prev_cumsum_m >= 0, "last_m < 0")
+    prev_cumsum_tile = tl.max(tl.where(prev_mask, cumsum_tile, zeros))
+    g_cumsum_m = tl.max(tl.where(g_range == g, cumsum_m, zeros))
+    m = g_cumsum_m - prev_cumsum_m
+    tl.device_assert(m >= 0, "m < 0")
+    num_m_tiles_out = tl.cdiv(m, BLOCK_SIZE_M)
+    tl.device_assert(num_m_tiles_out >= 0, "num_m_tiles < 0")
+    tile_in_mm = tile - prev_cumsum_tile
+    tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
+    #      g, m, num_m_tiles,     last_m,        tile_in_mm
+    return g, m, num_m_tiles_out, prev_cumsum_m, tile_in_mm
 
 
 @triton.jit
