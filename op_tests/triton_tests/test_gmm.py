@@ -248,7 +248,10 @@ def test_gmm(
         )
 
 
-def test_gmm_alt_trans_rhs_int64_group_sizes_grid_dim_override():
+@pytest.mark.parametrize("work_stealing", [False, True])
+def test_gmm_alt_trans_rhs_int64_group_sizes_grid_dim_override_work_stealing(
+    work_stealing: bool,
+):
     M, K, N, G = OTHER_REAL_SHAPE
 
     lhs, rhs, multiple_group_sizes, out_torch, _ = gen_gmm_tensors(
@@ -277,6 +280,7 @@ def test_gmm_alt_trans_rhs_int64_group_sizes_grid_dim_override():
                 group_sizes,
                 existing_out=out_triton,
                 grid_dim=240,  # feature under test
+                work_stealing=work_stealing,  # feature under test
             )
 
         m = int(torch.sum(group_sizes).item())
